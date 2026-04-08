@@ -15,17 +15,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# Minimum columns for an existing post_generations table to be kept (not recreated).
-_REQUIRED_POST_GENERATION_COLUMNS = frozenset(
-    {
-        "user_query",
-        "intent",
-        "parent_post_id",
-        "insights_summary",
-    }
-)
-
-
 def _migrate_usage_off_post_row(engine) -> None:
     """Move usage_* from post_generations into post_generation_usage; drop legacy columns."""
     from app.models import PostGenerationUsage
@@ -70,7 +59,7 @@ def _migrate_usage_off_post_row(engine) -> None:
 
 
 def ensure_post_generations_schema() -> None:
-    """Create tables; migrate legacy usage columns; align schema with ORM."""
+    """Create tables if missing; add newer columns; migrate legacy usage_* off post rows."""
     from app.models import PostGeneration, PostGenerationUsage
 
     engine = get_engine()
@@ -81,15 +70,8 @@ def ensure_post_generations_schema() -> None:
         )
         return
 
-    cols = {c["name"] for c in insp.get_columns("post_generations")}
-    if not _REQUIRED_POST_GENERATION_COLUMNS.issubset(cols):
-        with engine.begin() as conn:
-            conn.execute(text("DROP TABLE IF EXISTS post_generation_usage"))
-            conn.execute(text("DROP TABLE IF EXISTS post_generations"))
-        Base.metadata.create_all(
-            bind=engine, tables=[PostGeneration.__table__, PostGenerationUsage.__table__]
-        )
-        return
+    if not insp.has_table("post_generation_usage"):
+        Base.metadata.create_all(bind=engine, tables=[PostGenerationUsage.__table__])
 
     _extra_columns: list[tuple[str, str]] = [
         (

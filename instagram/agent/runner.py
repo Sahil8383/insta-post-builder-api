@@ -1,4 +1,4 @@
-"""Shared Anthropic tool loop for sync and streaming agents."""
+"""Anthropic tool loop with streaming Messages API (SSE-friendly)."""
 
 from __future__ import annotations
 
@@ -240,64 +240,6 @@ def _run_tool_round(
     return completion
 
 
-def run_agent_sync(
-    messages: list[dict[str, Any]],
-    *,
-    system_prompt: str,
-    tools: list[dict[str, Any]],
-    emit: StreamEventFn | None = None,
-) -> AgentResult:
-    """
-    Run the tool-use loop until a completion tool is called or max iterations.
-    If emit is set, it receives event dicts for optional logging/SSE (non-streaming API).
-    """
-    settings = get_settings()
-    if not settings.anthropic_api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
-
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    msg_id = str(uuid.uuid4())
-    if emit:
-        emit({"type": "assistant-message-id", "messageId": msg_id})
-
-    for iteration in range(MAX_ITERATIONS):
-        if emit:
-            emit({"type": "iteration", "index": iteration})
-
-        response = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=8192,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        )
-        record_anthropic_usage(
-            getattr(response, "usage", None), channel="orchestrator"
-        )
-
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text":
-                    if emit:
-                        emit({"type": "text-delta", "delta": block.text})
-                    recovered = _try_recover_payload_from_text(block.text)
-                    if recovered:
-                        return recovered
-            break
-
-        for block in response.content:
-            if block.type == "text" and emit:
-                emit({"type": "text-delta", "delta": block.text})
-
-        completion = _run_tool_round(response, messages, emit=emit)
-        if completion is not None:
-            return completion
-
-    raise RuntimeError(
-        "Agent did not call submit_post_package or submit_insights within iteration limit."
-    )
-
-
 def run_agent_streaming(
     messages: list[dict[str, Any]],
     *,
@@ -305,7 +247,7 @@ def run_agent_streaming(
     tools: list[dict[str, Any]],
     emit: StreamEventFn,
 ) -> AgentResult:
-    """Same loop as run_agent_sync using client.messages.stream for token/tool deltas."""
+    """Run the tool-use loop with client.messages.stream until a completion tool or max iterations."""
     settings = get_settings()
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured.")

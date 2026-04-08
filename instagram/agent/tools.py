@@ -39,69 +39,6 @@ def web_search(query: str) -> str:
     return "Research notes:\n" + "\n".join(lines)
 
 
-def analyze_request(
-    user_request: str,
-    topic_hint: str = "",
-    tone_hint: str = "",
-    target_audience_hint: str = "",
-    media_mode: str = "auto",
-) -> str:
-    """
-    Classify intent and propose an ordered tool plan (including whether web_search is needed).
-    Returns JSON for the agent; use format_stream_tool_result for minimal SSE display.
-    """
-    mm = (media_mode or "auto").strip().lower()
-    if mm not in ("stock", "generate", "auto"):
-        mm = "auto"
-    prompt = f"""You are a planning module for an Instagram post-building agent.
-
-Given the user request and hints, output ONE JSON object only (no markdown, no preamble).
-
-## Allowed tool names (use these exact strings in tool_sequence)
-analyze_request (already done — do not include),
-web_search, write_caption, critique_caption, pick_hashtags,
-generate_image, fetch_stock_media, build_feed_canvas_html,
-submit_post_package, submit_insights
-
-## Rules
-- intent: one of CREATE, UPDATE, RESEARCH, ANALYSE (same meanings as the main agent: CREATE/UPDATE build a post; RESEARCH/ANALYSE are research-only, end with submit_insights not submit_post_package).
-- needs_web_search: true only if the user needs fresh facts, trends, news, or niche research not inferable from the request; false if they gave enough context or only want copy/visuals.
-- web_search_queries: 1-3 short search strings if needs_web_search is true; else [].
-- tool_sequence: ordered list of tools to call AFTER planning — omit analyze_request. Include the correct completion tool last: submit_post_package for CREATE/UPDATE, submit_insights for RESEARCH/ANALYSE. For CREATE/UPDATE include caption/hashtag/media/visual steps per media_mode:
-  - media_mode "stock": use fetch_stock_media (not generate_image) unless user explicitly wants AI art.
-  - media_mode "generate": use generate_image (not fetch_stock_media).
-  - media_mode "auto": prefer fetch_stock_media; use generate_image only if the user clearly wants AI-generated/synthetic imagery.
-- RESEARCH/ANALYSE: tool_sequence must NOT include generate_image, fetch_stock_media, or build_feed_canvas_html; may include web_search then submit_insights.
-- rationale: one short sentence.
-
-## Input
-user_request:
-{user_request.strip()}
-
-topic_hint: {topic_hint or "(none)"}
-tone_hint: {tone_hint or "(none)"}
-target_audience_hint: {target_audience_hint or "(none)"}
-media_mode: {mm}
-
-Output valid JSON with keys: intent, needs_web_search, web_search_queries, tool_sequence, rationale."""
-    raw = _anthropic_text(prompt, max_tokens=1024)
-    s = (raw or "").strip()
-    if s.startswith("```"):
-        s = _strip_code_fences(s)
-    try:
-        data = json.loads(s)
-    except json.JSONDecodeError:
-        return json.dumps(
-            {
-                "error": "Planner did not return valid JSON.",
-                "raw_preview": (raw or "")[:400],
-            }
-        )
-    if not isinstance(data, dict):
-        return json.dumps({"error": "Planner JSON was not an object."})
-    return json.dumps(data)
-
-
 def _anthropic_text(prompt: str, max_tokens: int = 2048) -> str:
     settings = get_settings()
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
@@ -572,36 +509,6 @@ def _format_build_canvas_for_stream(raw: str) -> str:
     return raw
 
 
-def _format_analyze_request_for_stream(raw: str) -> str:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return (raw or "")[:8000]
-    if not isinstance(data, dict):
-        return raw[:8000] if raw else ""
-    if data.get("error"):
-        return json.dumps(
-            {"error": data.get("error"), "raw_preview": data.get("raw_preview")},
-            ensure_ascii=False,
-        )
-    intent = data.get("intent", "")
-    nws = data.get("needs_web_search")
-    seq = data.get("tool_sequence") or []
-    rationale = str(data.get("rationale") or "").strip()
-    queries = data.get("web_search_queries") or []
-    lines = [
-        f"Intent: {intent}",
-        f"Web search: {'yes' if nws else 'no'}",
-    ]
-    if isinstance(queries, list) and queries:
-        lines.append("Queries: " + "; ".join(str(q) for q in queries[:5]))
-    if isinstance(seq, list) and seq:
-        lines.append("Plan: " + " → ".join(str(x) for x in seq))
-    if rationale:
-        lines.append(f"Note: {rationale}")
-    return "\n".join(lines)
-
-
 def _format_critique_for_stream(raw: str) -> str:
     s = (raw or "").strip()
     if len(s) <= 600:
@@ -624,15 +531,12 @@ def format_stream_tool_result(tool_name: str, raw_result: str) -> str:
         return _format_json_image_urls_for_stream(raw)
     if tool_name == "build_feed_canvas_html":
         return _format_build_canvas_for_stream(raw)
-    if tool_name == "analyze_request":
-        return _format_analyze_request_for_stream(raw)
     if tool_name == "critique_caption":
         return _format_critique_for_stream(raw)
     return raw[:8000] if len(raw) > 8000 else raw
 
 
 TOOL_DISPATCH: dict[str, Any] = {
-    "analyze_request": analyze_request,
     "web_search": web_search,
     "write_caption": write_caption,
     "critique_caption": critique_caption,

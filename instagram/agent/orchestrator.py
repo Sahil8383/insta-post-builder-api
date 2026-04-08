@@ -2,22 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.config import get_settings
 
-from instagram.agent.runner import AgentResult, run_agent_streaming, run_agent_sync
+from instagram.agent.runner import AgentResult, run_agent_streaming
 from instagram.agent.usage_tracking import UsageLedger, usage_ledger_scope
 
 SYSTEM_PROMPT = """You are an expert Instagram content creator and agent. You use tools to help the user.
 
-## First tool call — analyze_request (required)
+## Classify intent first
 
-Call **analyze_request** once at the start with the user's request and the same hints you see in the user message (topic/tone/audience/media_mode). It returns JSON: `intent`, `needs_web_search`, `web_search_queries`, `tool_sequence`, `rationale`. Follow that plan: run `tool_sequence` in order (skip tools already satisfied). If `needs_web_search` is false, do **not** call web_search unless the user later asks for new facts. You may adapt the plan if the user message is ambiguous, but stay aligned with intent and media rules below.
-
-## Before other tool calls — classify intent (must match analyze_request unless you revise)
-
-Decide exactly one intent from the user's message and context:
+Decide exactly one intent from the user's message and context before choosing tools:
 
 - CREATE: user wants a new post built end-to-end (caption, hashtags, background image, overlay copy for the app editor).
 - UPDATE: user wants to refine a post; prior post context is provided when applicable.
@@ -94,30 +90,8 @@ You must end every successful task with exactly one call to the appropriate comp
 
 TOOLS: list[dict[str, Any]] = [
     {
-        "name": "analyze_request",
-        "description": "Plan the run: classify intent (CREATE/UPDATE/RESEARCH/ANALYSE), whether web_search is needed, and an ordered list of tools to call including the correct completion tool. Call once at the beginning.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "user_request": {
-                    "type": "string",
-                    "description": "The user's message / task in full",
-                },
-                "topic_hint": {"type": "string"},
-                "tone_hint": {"type": "string"},
-                "target_audience_hint": {"type": "string"},
-                "media_mode": {
-                    "type": "string",
-                    "enum": ["auto", "stock", "generate"],
-                    "description": "Same as user message media_mode",
-                },
-            },
-            "required": ["user_request"],
-        },
-    },
-    {
         "name": "web_search",
-        "description": "Search the web for trends, facts, hooks, niche context. Skip if analyze_request says needs_web_search is false or the user already gave sufficient context.",
+        "description": "Search the web for trends, facts, hooks, niche context. Skip when the user already gave sufficient context or only needs copy/visuals without new facts.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -511,12 +485,11 @@ def run_post_agent(
     parent_context: str | None = None,
     recent_posts_memory: str = "(no prior completed posts in database)",
     media_mode: str = "auto",
-    stream: bool = False,
-    emit=None,
+    emit: Callable[[dict[str, Any]], None],
     usage_ledger: UsageLedger | None = None,
 ) -> AgentResult:
     """
-    Run the agent. If stream=True, emit() receives event dicts (for SSE); uses streaming API.
+    Run the agent with the streaming Messages API. ``emit`` receives SSE-shaped event dicts.
 
     Pass ``usage_ledger`` to record token counts and estimated USD for this query (also activates
     context for nested tool API calls).
@@ -540,17 +513,7 @@ def run_post_agent(
     ]
 
     with usage_ledger_scope(usage_ledger):
-        if stream:
-            if emit is None:
-                raise ValueError("stream=True requires emit callback")
-            return run_agent_streaming(
-                messages,
-                system_prompt=SYSTEM_PROMPT,
-                tools=TOOLS,
-                emit=emit,
-            )
-
-        return run_agent_sync(
+        return run_agent_streaming(
             messages,
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,

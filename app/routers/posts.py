@@ -277,70 +277,6 @@ async def _read_json_body(request: Request) -> dict[str, Any] | JSONResponse:
         return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
 
 
-@router.post("/api/posts/generate")
-async def post_generate(request: Request, db: Session = Depends(get_db)) -> Response:
-    raw = await _read_json_body(request)
-    if isinstance(raw, JSONResponse):
-        return raw
-    body = raw
-
-    query, topic, tone, audience = _resolve_query_and_hints(body)
-    if query is None:
-        return _MISSING_QUERY
-
-    media_mode = _normalize_media_mode(body)
-
-    parent_post, err = _resolve_parent_post(db, body)
-    if err:
-        return err
-
-    parent_context = _parent_context_block(parent_post) if parent_post else None
-    memory = recent_posts_memory(db)
-    usage_ledger = UsageLedger()
-    settings = get_settings()
-    try:
-        result = run_post_agent(
-            query=query,
-            tone=tone,
-            target_audience=audience,
-            topic=topic,
-            parent_context=parent_context,
-            recent_posts_memory=memory,
-            media_mode=media_mode,
-            stream=False,
-            usage_ledger=usage_ledger,
-        )
-    except Exception as exc:
-        pg = create_post(
-            db,
-            **_failed_row_kwargs(
-                query=query,
-                topic=topic,
-                tone=tone,
-                audience=audience,
-                parent_post=parent_post,
-                err_text=_debug_error_text(exc, settings.debug),
-            ),
-        )
-        create_post_usage(db, pg.id, usage_ledger)
-        return JSONResponse(
-            {**_post_json_lean(pg), "detail": str(exc)},
-            status_code=502,
-        )
-
-    pg = _persist_agent_success(
-        db,
-        query=query,
-        topic=topic,
-        tone=tone,
-        audience=audience,
-        parent_post=parent_post,
-        agent_result=result,
-        usage_ledger=usage_ledger,
-    )
-    return JSONResponse(_post_json_lean(pg))
-
-
 @router.post("/api/posts/generate/stream")
 async def post_generate_stream(request: Request) -> Response:
     raw = await _read_json_body(request)
@@ -384,7 +320,6 @@ async def post_generate_stream(request: Request) -> Response:
                 parent_context=parent_context,
                 recent_posts_memory=memory,
                 media_mode=media_mode,
-                stream=True,
                 emit=emit,
                 usage_ledger=usage_ledger,
             )
