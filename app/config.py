@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     usage_tavily_per_search_usd: float = 0.008
     usage_pexels_per_request_usd: float = 0.0
 
+    # Streaming / agent orchestration
+    stream_queue_maxsize: int = 256
+    stream_get_timeout_seconds: float = 30.0
+    agent_max_runtime_seconds: float = 900.0
+    agent_thread_join_timeout_seconds: float = 960.0
+    max_concurrent_streams: int = 100
+    anthropic_stream_max_retries: int = 3
+    max_stream_request_body_bytes: int = 524_288
+
     @property
     def data_dir(self) -> Path:
         d = _BACKEND_ROOT / "data"

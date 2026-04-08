@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable
 
 from app.config import get_settings
@@ -487,6 +488,7 @@ def run_post_agent(
     media_mode: str = "auto",
     emit: Callable[[dict[str, Any]], None],
     usage_ledger: UsageLedger | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> AgentResult:
     """
     Run the agent with the streaming Messages API. ``emit`` receives SSE-shaped event dicts.
@@ -518,6 +520,7 @@ def run_post_agent(
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             emit=emit,
+            cancel_event=cancel_event,
         )
 
 

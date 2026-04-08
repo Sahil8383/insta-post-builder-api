@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import anthropic
+from anthropic import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 from app.config import get_settings
 from instagram.agent.tools import (
@@ -126,6 +134,13 @@ def _try_recover_payload_from_text(text: str) -> AgentResult | None:
 
 
 StreamEventFn = Callable[[dict[str, Any]], None]
+
+_STREAM_RETRY_EXCEPTIONS = (
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+)
 
 
 def _assistant_content_from_response(response: Any) -> list[dict[str, Any]]:
@@ -246,6 +261,7 @@ def run_agent_streaming(
     system_prompt: str,
     tools: list[dict[str, Any]],
     emit: StreamEventFn,
+    cancel_event: threading.Event | None = None,
 ) -> AgentResult:
     """Run the tool-use loop with client.messages.stream until a completion tool or max iterations."""
     settings = get_settings()
@@ -255,49 +271,70 @@ def run_agent_streaming(
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     emit({"type": "assistant-message-id", "messageId": str(uuid.uuid4())})
 
+    max_retries = max(1, int(settings.anthropic_stream_max_retries))
+    deadline = time.monotonic() + float(settings.agent_max_runtime_seconds)
+
     for iteration in range(MAX_ITERATIONS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Agent cancelled by client")
+        if time.monotonic() > deadline:
+            raise TimeoutError("Agent exceeded max runtime")
+
         emit({"type": "iteration", "index": iteration})
         emit({"type": "heartbeat"})
 
-        with client.messages.stream(
-            model=settings.anthropic_model,
-            max_tokens=8192,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        ) as stream:
-            stream_tool_id = ""
-            stream_tool_name = ""
-            for event in stream:
-                et = getattr(event, "type", None)
-                if et == "content_block_start":
-                    cb = getattr(event, "content_block", None)
-                    if cb is not None and getattr(cb, "type", None) == "tool_use":
-                        stream_tool_id = cb.id
-                        stream_tool_name = cb.name
-                        emit(
-                            {
-                                "type": "tool-call-start",
-                                "toolCallId": cb.id,
-                                "toolName": cb.name,
-                            }
-                        )
-                elif et == "content_block_delta":
-                    delta = event.delta
-                    dt = getattr(delta, "type", None)
-                    if dt == "text_delta":
-                        emit({"type": "reasoning-delta", "delta": delta.text})
-                    elif dt == "input_json_delta":
-                        if stream_tool_name not in COMPLETION_TOOL_NAMES:
-                            emit(
-                                {
-                                    "type": "tool-call-delta",
-                                    "toolCallId": stream_tool_id,
-                                    "toolName": stream_tool_name,
-                                    "arguments": delta.partial_json,
-                                }
-                            )
-            response = stream.get_final_message()
+        response = None
+        for attempt in range(max_retries):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Agent cancelled by client")
+            try:
+                with client.messages.stream(
+                    model=settings.anthropic_model,
+                    max_tokens=8192,
+                    system=system_prompt,
+                    tools=tools,
+                    messages=messages,
+                ) as stream:
+                    stream_tool_id = ""
+                    stream_tool_name = ""
+                    for event in stream:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("Agent cancelled by client")
+                        et = getattr(event, "type", None)
+                        if et == "content_block_start":
+                            cb = getattr(event, "content_block", None)
+                            if cb is not None and getattr(cb, "type", None) == "tool_use":
+                                stream_tool_id = cb.id
+                                stream_tool_name = cb.name
+                                emit(
+                                    {
+                                        "type": "tool-call-start",
+                                        "toolCallId": cb.id,
+                                        "toolName": cb.name,
+                                    }
+                                )
+                        elif et == "content_block_delta":
+                            delta = event.delta
+                            dt = getattr(delta, "type", None)
+                            if dt == "text_delta":
+                                emit({"type": "reasoning-delta", "delta": delta.text})
+                            elif dt == "input_json_delta":
+                                if stream_tool_name not in COMPLETION_TOOL_NAMES:
+                                    emit(
+                                        {
+                                            "type": "tool-call-delta",
+                                            "toolCallId": stream_tool_id,
+                                            "toolName": stream_tool_name,
+                                            "arguments": delta.partial_json,
+                                        }
+                                    )
+                    response = stream.get_final_message()
+                break
+            except _STREAM_RETRY_EXCEPTIONS:
+                if attempt >= max_retries - 1:
+                    raise
+        assert response is not None
+
         record_anthropic_usage(
             getattr(response, "usage", None), channel="orchestrator"
         )
