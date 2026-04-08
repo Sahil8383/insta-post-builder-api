@@ -11,7 +11,11 @@ from instagram.agent.usage_tracking import UsageLedger, usage_ledger_scope
 
 SYSTEM_PROMPT = """You are an expert Instagram content creator and agent. You use tools to help the user.
 
-## Before any tool call — classify intent (internal reasoning, no separate model)
+## First tool call — analyze_request (required)
+
+Call **analyze_request** once at the start with the user's request and the same hints you see in the user message (topic/tone/audience/media_mode). It returns JSON: `intent`, `needs_web_search`, `web_search_queries`, `tool_sequence`, `rationale`. Follow that plan: run `tool_sequence` in order (skip tools already satisfied). If `needs_web_search` is false, do **not** call web_search unless the user later asks for new facts. You may adapt the plan if the user message is ambiguous, but stay aligned with intent and media rules below.
+
+## Before other tool calls — classify intent (must match analyze_request unless you revise)
 
 Decide exactly one intent from the user's message and context:
 
@@ -90,8 +94,30 @@ You must end every successful task with exactly one call to the appropriate comp
 
 TOOLS: list[dict[str, Any]] = [
     {
+        "name": "analyze_request",
+        "description": "Plan the run: classify intent (CREATE/UPDATE/RESEARCH/ANALYSE), whether web_search is needed, and an ordered list of tools to call including the correct completion tool. Call once at the beginning.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_request": {
+                    "type": "string",
+                    "description": "The user's message / task in full",
+                },
+                "topic_hint": {"type": "string"},
+                "tone_hint": {"type": "string"},
+                "target_audience_hint": {"type": "string"},
+                "media_mode": {
+                    "type": "string",
+                    "enum": ["auto", "stock", "generate"],
+                    "description": "Same as user message media_mode",
+                },
+            },
+            "required": ["user_request"],
+        },
+    },
+    {
         "name": "web_search",
-        "description": "Search the web for trends, facts, hooks, niche context. Skip if the user already gave sufficient context.",
+        "description": "Search the web for trends, facts, hooks, niche context. Skip if analyze_request says needs_web_search is false or the user already gave sufficient context.",
         "input_schema": {
             "type": "object",
             "properties": {

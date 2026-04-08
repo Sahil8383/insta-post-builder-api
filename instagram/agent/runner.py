@@ -10,7 +10,12 @@ from typing import Any, Callable
 import anthropic
 
 from app.config import get_settings
-from instagram.agent.tools import hashtags_to_string, parse_submit_payload, run_tool
+from instagram.agent.tools import (
+    format_stream_tool_result,
+    hashtags_to_string,
+    parse_submit_payload,
+    run_tool,
+)
 from instagram.agent.usage_tracking import record_anthropic_usage
 
 # One iteration = one Messages API round-trip (may include multiple tool calls in one turn).
@@ -226,7 +231,7 @@ def _run_tool_round(
                         "toolCallId": block.id,
                         "toolName": name,
                         "arguments": args_str,
-                        "result": result_text[:8000],
+                        "result": format_stream_tool_result(name, result_text),
                     }
                 )
 
