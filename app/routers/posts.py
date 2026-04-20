@@ -1,4 +1,4 @@
-"""Post generation API (parity with former Django instagram/views.py)."""
+"""Post generation API (streaming agent + slim post storage)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -18,17 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.crud import (
-    create_post,
-    create_post_usage,
-    get_post,
-    get_post_usage,
-    list_posts,
-    recent_posts_memory,
-)
+from app.crud import create_post, get_post, list_posts, recent_posts_memory
 from app.database import get_db, get_session_factory
-from app.models import PostGeneration
-from instagram.agent.orchestrator import agent_result_to_post_fields, run_post_agent
+from app.models import Post
+from instagram.agent.orchestrator import agent_result_to_persist_content, run_post_agent
 from instagram.agent.runner import AgentResult, sse_format_event, sse_heartbeat
 from instagram.agent.usage_tracking import UsageLedger
 
@@ -56,6 +50,7 @@ class GenerateStreamBody(BaseModel):
     audience: str = Field(default="", max_length=512)
     media_mode: Literal["stock", "generate", "auto"] = "auto"
     post_id: int | None = Field(default=None, ge=1)
+    post_name: str = Field(default="", max_length=512)
 
     @model_validator(mode="after")
     def query_or_hints(self) -> GenerateStreamBody:
@@ -87,6 +82,7 @@ class AgentRunOutcome:
     db_session_summary: str = ""
     persist_error: Exception | None = None
 
+
 _MISSING_QUERY = JSONResponse(
     {
         "detail": "Provide `query`, or all of `topic`, `tone`, and `target_audience`.",
@@ -101,83 +97,33 @@ def _debug_error_text(exc: BaseException, debug: bool) -> str:
     return str(exc)
 
 
-def _post_json_lean(pg: PostGeneration) -> dict[str, Any]:
-    """Content-focused shape for API responses; omits empty optional strings/lists/objects."""
-    is_insights = bool((pg.insights_summary or "").strip())
+def _post_json_lean(pg: Post) -> dict[str, Any]:
+    """API shape: id, display name, HTML, cost, timestamps."""
     out: dict[str, Any] = {
         "id": pg.id,
-        "result_kind": "insights" if is_insights else "post",
+        "post_name": pg.post_name,
+        "html_content": pg.html_content,
+        "cost_to_build_post": float(pg.cost_to_build_post),
         "status": pg.status,
         "created_at": pg.created_at.isoformat(),
     }
-
-    def put_str(key: str, val: str | None, *, max_len: int | None = None) -> None:
-        s = (val or "").strip()
-        if not s:
-            return
-        if max_len is not None:
-            s = s[:max_len]
-        out[key] = s
-
-    put_str("user_query", pg.user_query, max_len=10000)
-    put_str("intent", pg.intent)
-    put_str("topic", pg.topic)
-    put_str("tone", pg.tone)
-    put_str("target_audience", pg.target_audience)
-    put_str("caption", pg.caption)
-    put_str("hashtags", pg.hashtags)
-    put_str("search_notes", pg.search_notes)
-    put_str("post_type", pg.post_type)
-    put_str("overlay_text", pg.overlay_text)
-    put_str("overlay_position", pg.overlay_position)
-    put_str("text_style", pg.text_style)
-    put_str("suggested_posting_time", pg.suggested_posting_time)
-    put_str("image_url", pg.image_url or "")
-    put_str("video_url", pg.video_url or "")
-    put_str("media_type", pg.media_type or "image")
-    put_str("media_attribution", pg.media_attribution)
-    put_str("image_prompt", pg.image_prompt)
-    put_str("session_summary", pg.session_summary)
-    put_str("error_message", pg.error_message)
-
-    if is_insights:
-        put_str("insights_summary", pg.insights_summary)
-        bullets = pg.insights_bullets or []
-        if bullets:
-            out["insights_bullets"] = bullets
-    else:
-        pkg = pg.engagement_package or {}
-        if isinstance(pkg, dict) and pkg:
-            out["engagement_package"] = pkg
-
     if pg.parent_post_id is not None:
         out["parent_post_id"] = pg.parent_post_id
-
+    err = (pg.error_message or "").strip()
+    if err:
+        out["error_message"] = err
     return out
 
 
-def _parent_context_block(pg: PostGeneration) -> str:
-    parts = [
-        f"id: {pg.id}",
-        f"topic: {pg.topic}",
-        f"tone: {pg.tone}",
-        f"target_audience: {pg.target_audience}",
-        f"post_type: {pg.post_type}",
-        f"caption:\n{pg.caption}",
-        f"overlay_text: {pg.overlay_text}",
-        f"overlay_position: {pg.overlay_position}",
-        f"text_style: {pg.text_style}",
-        f"hashtags: {pg.hashtags}",
-        f"image_url: {pg.image_url or ''}",
-        f"video_url: {pg.video_url or ''}",
-        f"media_type: {pg.media_type or 'image'}",
-        f"media_attribution: {pg.media_attribution or ''}",
-        f"image_prompt: {pg.image_prompt}",
-    ]
-    pkg = pg.engagement_package if isinstance(pg.engagement_package, dict) else {}
-    if pkg.get("feed_canvas_html"):
-        parts.append("prior_feed_canvas_html: (present; regenerate with build_feed_canvas_html if media or overlay changed)")
-    return "\n".join(parts)
+def _parent_context_block(pg: Post) -> str:
+    html = (pg.html_content or "").strip()
+    max_ctx = 120_000
+    if len(html) > max_ctx:
+        html = html[:max_ctx] + "\n<!-- truncated for agent context -->"
+    return (
+        "Current post HTML (edit in place when updating; keep structure where helpful):\n"
+        + html
+    )
 
 
 def _resolve_query_and_hints(
@@ -201,7 +147,7 @@ def _resolve_query_and_hints(
 
 def _resolve_parent_post(
     session: Session, body: dict[str, Any]
-) -> tuple[PostGeneration | None, JSONResponse | None]:
+) -> tuple[Post | None, JSONResponse | None]:
     raw = body.get("post_id")
     if raw is None or raw == "":
         return None, None
@@ -222,67 +168,32 @@ def _row_topic_fallback(topic: str, query: str) -> str:
     if t:
         return t[:512]
     q = query.strip().replace("\n", " ")
-    return (q[:512] if q else "General")
+    return (q[:512] if q else "Untitled")
 
 
-def _create_post_from_agent(
-    session: Session,
-    *,
-    query: str,
-    topic: str,
-    tone: str,
-    audience: str,
-    parent_post: PostGeneration | None = None,
-    parent_post_id: int | None = None,
-    agent_payload: dict[str, Any],
-) -> PostGeneration:
-    row_topic = _row_topic_fallback(topic, query)
-    url = agent_payload.get("image_url") or ""
-    if url:
-        agent_payload = {**agent_payload, "image_url": str(url)[:2048]}
-    vurl = agent_payload.get("video_url") or ""
-    if vurl:
-        agent_payload = {**agent_payload, "video_url": str(vurl)[:2048]}
-    base: dict[str, Any] = {
-        "user_query": query[:10000] if query else "",
-        "topic": row_topic,
-        "tone": tone,
-        "target_audience": audience,
-        "status": PostGeneration.Status.COMPLETED,
-        **agent_payload,
-    }
-    if not (str(base.get("tone") or "").strip()):
-        base["tone"] = (tone or "")[:128]
-    if not (str(base.get("target_audience") or "").strip()):
-        base["target_audience"] = (audience or "")[:512]
-    if parent_post is not None:
-        base["parent_post"] = parent_post
-    elif parent_post_id is not None:
-        base["parent_post_id"] = parent_post_id
-    return create_post(session, **base)
+def _failed_post_display_name(post_name_override: str, topic: str, query: str) -> str:
+    if (post_name_override or "").strip():
+        return post_name_override.strip()[:512]
+    return _row_topic_fallback(topic, query)
 
 
 def _failed_row_kwargs(
     *,
-    query: str,
+    post_name_override: str,
     topic: str,
-    tone: str,
-    audience: str,
-    parent_post: PostGeneration | None = None,
-    parent_post_id: int | None = None,
+    query: str,
     err_text: str,
+    cost: Decimal,
+    parent_post_id: int | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
-        "user_query": query[:10000] if query else "",
-        "topic": _row_topic_fallback(topic, query),
-        "tone": tone,
-        "target_audience": audience,
-        "status": PostGeneration.Status.FAILED,
+        "post_name": _failed_post_display_name(post_name_override, topic, query),
+        "html_content": "",
+        "cost_to_build_post": cost,
+        "status": Post.Status.FAILED,
         "error_message": err_text,
     }
-    if parent_post is not None:
-        row["parent_post"] = parent_post
-    elif parent_post_id is not None:
+    if parent_post_id is not None:
         row["parent_post_id"] = parent_post_id
     return row
 
@@ -290,46 +201,43 @@ def _failed_row_kwargs(
 def _persist_agent_success(
     session: Session,
     *,
-    query: str,
-    topic: str,
-    tone: str,
-    audience: str,
-    parent_post: PostGeneration | None = None,
-    parent_post_id: int | None = None,
+    post_name_override: str,
+    parent_post_id: int | None,
     agent_result: Any,
     usage_ledger: UsageLedger,
-) -> PostGeneration:
-    fields = agent_result_to_post_fields(agent_result)
-    fields.pop("result_kind", None)
-    pg = _create_post_from_agent(
-        session,
-        query=query,
-        topic=topic,
-        tone=tone,
-        audience=audience,
-        parent_post=parent_post,
-        parent_post_id=parent_post_id,
-        agent_payload=fields,
-    )
-    create_post_usage(session, pg.id, usage_ledger)
-    return pg
+) -> tuple[Post, str, str]:
+    content = agent_result_to_persist_content(agent_result)
+    rk = content["result_kind"]
+    session_summary = content["session_summary"]
+    name = (post_name_override.strip() or content["suggested_post_name"])[:512]
+    cost = usage_ledger.estimate_total_usd()
+    kwargs: dict[str, Any] = {
+        "post_name": name,
+        "html_content": content["html_content"],
+        "cost_to_build_post": cost,
+        "status": Post.Status.COMPLETED,
+    }
+    if parent_post_id is not None:
+        kwargs["parent_post_id"] = parent_post_id
+    pg = create_post(session, **kwargs)
+    return pg, rk, session_summary
 
 
 def _sync_persist_stream_outcome(
     SessionLocal: Any,
     outcome: AgentRunOutcome,
     *,
+    post_name_override: str,
     query: str,
     topic: str,
-    tone: str,
-    audience: str,
     parent_post_id: int | None,
     debug: bool,
 ) -> None:
-    """Write success or failure row + usage; update outcome with DB ids."""
+    """Write success or failure row; update outcome with DB ids."""
     session: Session = SessionLocal()
     try:
         err = outcome.error
+        cost = outcome.usage_ledger.estimate_total_usd()
         if err is not None:
             msg = (
                 "Request cancelled"
@@ -339,15 +247,14 @@ def _sync_persist_stream_outcome(
             pg = create_post(
                 session,
                 **_failed_row_kwargs(
-                    query=query,
+                    post_name_override=post_name_override,
                     topic=topic,
-                    tone=tone,
-                    audience=audience,
-                    parent_post_id=parent_post_id,
+                    query=query,
                     err_text=msg,
+                    cost=cost,
+                    parent_post_id=parent_post_id,
                 ),
             )
-            create_post_usage(session, pg.id, outcome.usage_ledger)
             outcome.db_post_id = pg.id
             return
 
@@ -355,47 +262,41 @@ def _sync_persist_stream_outcome(
             pg = create_post(
                 session,
                 **_failed_row_kwargs(
-                    query=query,
+                    post_name_override=post_name_override,
                     topic=topic,
-                    tone=tone,
-                    audience=audience,
-                    parent_post_id=parent_post_id,
+                    query=query,
                     err_text="No agent result",
+                    cost=cost,
+                    parent_post_id=parent_post_id,
                 ),
             )
-            create_post_usage(session, pg.id, outcome.usage_ledger)
             outcome.db_post_id = pg.id
             return
 
         try:
-            pg = _persist_agent_success(
+            pg, rk, summ = _persist_agent_success(
                 session,
-                query=query,
-                topic=topic,
-                tone=tone,
-                audience=audience,
+                post_name_override=post_name_override,
                 parent_post_id=parent_post_id,
                 agent_result=outcome.result,
                 usage_ledger=outcome.usage_ledger,
             )
-            rk = "insights" if (pg.insights_summary or "").strip() else "post"
             outcome.db_post_id = pg.id
             outcome.db_result_kind = rk
-            outcome.db_session_summary = (pg.session_summary or "").strip()
+            outcome.db_session_summary = summ
         except Exception as exc:
             outcome.persist_error = exc
             pg = create_post(
                 session,
                 **_failed_row_kwargs(
-                    query=query,
+                    post_name_override=post_name_override,
                     topic=topic,
-                    tone=tone,
-                    audience=audience,
-                    parent_post_id=parent_post_id,
+                    query=query,
                     err_text=_debug_error_text(exc, debug),
+                    cost=cost,
+                    parent_post_id=parent_post_id,
                 ),
             )
-            create_post_usage(session, pg.id, outcome.usage_ledger)
             outcome.db_post_id = pg.id
     finally:
         session.close()
@@ -441,6 +342,8 @@ async def post_generate_stream(request: Request) -> Response:
     query, topic, tone, audience = _resolve_query_and_hints(body)
     if query is None:
         return _MISSING_QUERY
+
+    post_name_override = str(body.get("post_name") or "").strip()
 
     media_mode = str(body.get("media_mode") or "auto").strip().lower()
     if media_mode not in ("stock", "generate", "auto"):
@@ -537,10 +440,9 @@ async def post_generate_stream(request: Request) -> Response:
                         _sync_persist_stream_outcome,
                         SessionLocal,
                         outcome,
+                        post_name_override=post_name_override,
                         query=query,
                         topic=topic,
-                        tone=tone,
-                        audience=audience,
                         parent_post_id=parent_post_id,
                         debug=settings.debug,
                     )
@@ -683,19 +585,3 @@ def post_detail(pk: int, db: Session = Depends(get_db)) -> JSONResponse:
     if pg is None:
         raise HTTPException(status_code=404, detail="Not found.")
     return JSONResponse(_post_json_lean(pg))
-
-
-@router.get("/api/posts/{pk}/usage/")
-def post_usage_detail(pk: int, db: Session = Depends(get_db)) -> JSONResponse:
-    if get_post(db, pk) is None:
-        raise HTTPException(status_code=404, detail="Not found.")
-    u = get_post_usage(db, pk)
-    if u is None:
-        raise HTTPException(status_code=404, detail="No usage recorded for this post.")
-    return JSONResponse(
-        {
-            "post_id": u.post_id,
-            "usage_breakdown": u.usage_breakdown or {},
-            "estimated_cost_usd": float(u.estimated_cost_usd),
-        }
-    )

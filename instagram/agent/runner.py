@@ -20,7 +20,6 @@ from anthropic import (
 from app.config import get_settings
 from instagram.agent.tools import (
     format_stream_tool_result,
-    hashtags_to_string,
     parse_submit_payload,
     run_tool,
 )
@@ -40,68 +39,13 @@ class AgentResult:
     payload: dict[str, Any]
 
 
-def _normalize_carousel_slides(raw: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        out.append(
-            {
-                "headline": str(item.get("headline") or "").strip(),
-                "body": str(item.get("body") or "").strip(),
-                "visual_hint": str(item.get("visual_hint") or "").strip(),
-            }
-        )
-    return out
-
-
-def _normalize_media_type(raw: Any) -> str:
-    s = str(raw or "").strip().lower()
-    if s == "video":
-        return "video"
-    return "image"
-
-
-def _normalize_str_list(raw: Any, *, limit: int | None = None) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        xs = [str(x).strip() for x in raw if str(x).strip()]
-    else:
-        xs = [str(raw).strip()] if str(raw).strip() else []
-    if limit is not None:
-        return xs[:limit]
-    return xs
-
-
 def _normalize_post_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    hashtags = hashtags_to_string(raw.get("hashtags"))
+    """Keep only fields used after completion (persist + SSE). Full tool args stay in logs only."""
     return {
-        "intent": (raw.get("intent") or "CREATE").strip(),
-        "post_type": (raw.get("post_type") or "").strip(),
-        "caption": raw.get("caption") or "",
-        "overlay_text": (raw.get("overlay_text") or "").strip(),
-        "overlay_position": (raw.get("overlay_position") or "center").strip(),
-        "text_style": (raw.get("text_style") or "bold").strip(),
-        "hashtags": hashtags,
-        "search_notes": raw.get("search_notes") or "",
-        "image_url": raw.get("image_url") or "",
-        "video_url": str(raw.get("video_url") or "").strip(),
-        "media_type": _normalize_media_type(raw.get("media_type")),
-        "media_attribution": str(raw.get("media_attribution") or "").strip(),
-        "image_prompt": raw.get("image_prompt") or "",
-        "suggested_posting_time": (raw.get("suggested_posting_time") or "").strip(),
-        "resolved_topic": (raw.get("resolved_topic") or "").strip(),
-        "resolved_tone": (raw.get("resolved_tone") or "").strip(),
-        "resolved_target_audience": (raw.get("resolved_target_audience") or "").strip(),
-        "carousel_slides": _normalize_carousel_slides(raw.get("carousel_slides")),
-        "story_prompts": _normalize_str_list(raw.get("story_prompts")),
-        "comment_starters": _normalize_str_list(raw.get("comment_starters")),
-        "alt_hooks": _normalize_str_list(raw.get("alt_hooks"), limit=2),
-        "session_summary": str(raw.get("session_summary") or "").strip(),
         "canvas_html": str(raw.get("canvas_html") or "").strip(),
+        "session_summary": str(raw.get("session_summary") or "").strip(),
+        "resolved_topic": str(raw.get("resolved_topic") or "").strip(),
+        "overlay_text": str(raw.get("overlay_text") or "").strip(),
     }
 
 

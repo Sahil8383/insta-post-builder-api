@@ -5,13 +5,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import ensure_post_generations_schema
+from app.database import ensure_posts_schema
 from app.routers import posts
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    ensure_post_generations_schema()
+    ensure_posts_schema()
     yield
 
 
