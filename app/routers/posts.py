@@ -29,7 +29,24 @@ from instagram.agent.usage_tracking import UsageLedger
 router = APIRouter(tags=["posts"])
 logger = logging.getLogger(__name__)
 
+USER_QUERY_MAX_LEN = 16_000
+SESSION_SUMMARY_MAX_LEN = 8_000
+
 _stream_semaphore: asyncio.Semaphore | None = None
+
+
+def _truncate_user_query(q: str) -> str:
+    q = (q or "").strip()
+    if len(q) <= USER_QUERY_MAX_LEN:
+        return q
+    return q[:USER_QUERY_MAX_LEN] + "\n…"
+
+
+def _truncate_session_summary(s: str) -> str:
+    s = (s or "").strip()
+    if len(s) <= SESSION_SUMMARY_MAX_LEN:
+        return s
+    return s[:SESSION_SUMMARY_MAX_LEN] + "\n…"
 
 
 def _get_stream_semaphore() -> asyncio.Semaphore:
@@ -97,12 +114,13 @@ def _debug_error_text(exc: BaseException, debug: bool) -> str:
     return str(exc)
 
 
-def _post_json_lean(pg: Post) -> dict[str, Any]:
-    """API shape: id, display name, HTML, cost, timestamps."""
+def _post_json_summary(pg: Post) -> dict[str, Any]:
+    """List / metadata: no ``html_content`` (large)."""
     out: dict[str, Any] = {
         "id": pg.id,
         "post_name": pg.post_name,
-        "html_content": pg.html_content,
+        "user_query": pg.user_query or "",
+        "session_summary": pg.session_summary or "",
         "cost_to_build_post": float(pg.cost_to_build_post),
         "status": pg.status,
         "created_at": pg.created_at.isoformat(),
@@ -112,6 +130,13 @@ def _post_json_lean(pg: Post) -> dict[str, Any]:
     err = (pg.error_message or "").strip()
     if err:
         out["error_message"] = err
+    return out
+
+
+def _post_json_full(pg: Post) -> dict[str, Any]:
+    """Detail: includes ``html_content`` for iframe preview."""
+    out = _post_json_summary(pg)
+    out["html_content"] = pg.html_content
     return out
 
 
@@ -185,9 +210,12 @@ def _failed_row_kwargs(
     err_text: str,
     cost: Decimal,
     parent_post_id: int | None = None,
+    session_summary: str = "",
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "post_name": _failed_post_display_name(post_name_override, topic, query),
+        "user_query": _truncate_user_query(query),
+        "session_summary": _truncate_session_summary(session_summary),
         "html_content": "",
         "cost_to_build_post": cost,
         "status": Post.Status.FAILED,
@@ -205,6 +233,7 @@ def _persist_agent_success(
     parent_post_id: int | None,
     agent_result: Any,
     usage_ledger: UsageLedger,
+    user_query: str,
 ) -> tuple[Post, str, str]:
     content = agent_result_to_persist_content(agent_result)
     rk = content["result_kind"]
@@ -213,6 +242,8 @@ def _persist_agent_success(
     cost = usage_ledger.estimate_total_usd()
     kwargs: dict[str, Any] = {
         "post_name": name,
+        "user_query": _truncate_user_query(user_query),
+        "session_summary": _truncate_session_summary(session_summary),
         "html_content": content["html_content"],
         "cost_to_build_post": cost,
         "status": Post.Status.COMPLETED,
@@ -280,6 +311,7 @@ def _sync_persist_stream_outcome(
                 parent_post_id=parent_post_id,
                 agent_result=outcome.result,
                 usage_ledger=outcome.usage_ledger,
+                user_query=query,
             )
             outcome.db_post_id = pg.id
             outcome.db_result_kind = rk
@@ -573,10 +605,21 @@ async def post_generate_stream(request: Request) -> Response:
 
 
 @router.get("/api/posts/")
-def post_list(limit: int = 50, db: Session = Depends(get_db)) -> JSONResponse:
+def post_list(
+    limit: int = 50,
+    order: str = "desc",
+    include_html: int = 0,
+    db: Session = Depends(get_db),
+) -> JSONResponse:
     lim = min(limit, 200)
-    rows = list_posts(db, lim)
-    return JSONResponse({"results": [_post_json_lean(pg) for pg in rows]})
+    order_sql: Literal["asc", "desc"] = (
+        "asc" if order.strip().lower() == "asc" else "desc"
+    )
+    rows = list_posts(db, lim, order=order_sql)
+    want_html = include_html != 0
+    if want_html:
+        return JSONResponse({"results": [_post_json_full(pg) for pg in rows]})
+    return JSONResponse({"results": [_post_json_summary(pg) for pg in rows]})
 
 
 @router.get("/api/posts/{pk}/")
@@ -584,4 +627,4 @@ def post_detail(pk: int, db: Session = Depends(get_db)) -> JSONResponse:
     pg = get_post(db, pk)
     if pg is None:
         raise HTTPException(status_code=404, detail="Not found.")
-    return JSONResponse(_post_json_lean(pg))
+    return JSONResponse(_post_json_full(pg))

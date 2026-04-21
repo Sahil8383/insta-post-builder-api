@@ -22,6 +22,8 @@ class Post(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     post_name: Mapped[str] = mapped_column(String(512), default="")
+    user_query: Mapped[str] = mapped_column(Text, default="")
+    session_summary: Mapped[str] = mapped_column(Text, default="")
     html_content: Mapped[str] = mapped_column(Text, default="")
     cost_to_build_post: Mapped[Decimal] = mapped_column(
         Numeric(12, 6),

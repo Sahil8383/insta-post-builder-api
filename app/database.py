@@ -2,7 +2,7 @@
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -15,14 +15,32 @@ class Base(DeclarativeBase):
     pass
 
 
+def _ensure_post_columns_sqlite(engine) -> None:
+    """Add ``user_query`` / ``session_summary`` if upgrading an existing DB."""
+    insp = inspect(engine)
+    if not insp.has_table("posts"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(posts)")).fetchall()
+        col_names = {str(row[1]) for row in rows}
+        if "user_query" not in col_names:
+            conn.execute(text("ALTER TABLE posts ADD COLUMN user_query TEXT DEFAULT ''"))
+        if "session_summary" not in col_names:
+            conn.execute(
+                text("ALTER TABLE posts ADD COLUMN session_summary TEXT DEFAULT ''")
+            )
+
+
 def ensure_posts_schema() -> None:
-    """Create ``posts`` table if missing."""
+    """Create ``posts`` table if missing; apply additive column upgrades."""
     from app.models import Post
 
     engine = get_engine()
     insp = inspect(engine)
     if not insp.has_table("posts"):
         Base.metadata.create_all(bind=engine, tables=[Post.__table__])
+    elif engine.dialect.name == "sqlite":
+        _ensure_post_columns_sqlite(engine)
 
 
 def get_engine():
