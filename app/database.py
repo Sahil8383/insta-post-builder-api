@@ -15,6 +15,9 @@ class Base(DeclarativeBase):
     pass
 
 
+from app.models import Post
+
+
 def _ensure_post_columns_sqlite(engine) -> None:
     """Add ``user_query`` / ``session_summary`` if upgrading an existing DB."""
     insp = inspect(engine)
@@ -33,7 +36,6 @@ def _ensure_post_columns_sqlite(engine) -> None:
 
 def ensure_posts_schema() -> None:
     """Create ``posts`` table if missing; apply additive column upgrades."""
-    from app.models import Post
 
     engine = get_engine()
     insp = inspect(engine)
