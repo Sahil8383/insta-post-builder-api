@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv()
@@ -45,6 +46,12 @@ class Settings(BaseSettings):
     anthropic_stream_max_retries: int = 3
     max_stream_request_body_bytes: int = 524_288
 
+    database_dsn: str = Field(
+        default="",
+        validation_alias=AliasChoices("database_dsn", "DATABASE_URL"),
+        description="Postgres DSN for SQLAlchemy; empty uses SQLite in data_dir.",
+    )
+
     @property
     def data_dir(self) -> Path:
         d = _BACKEND_ROOT / "data"
@@ -52,7 +59,10 @@ class Settings(BaseSettings):
         return d
 
     @property
-    def database_url(self) -> str:
+    def resolved_database_url(self) -> str:
+        dsn = (self.database_dsn or "").strip()
+        if dsn:
+            return dsn
         p = (self.data_dir / "db.sqlite3").resolve()
         return f"sqlite:///{p.as_posix()}"
 
