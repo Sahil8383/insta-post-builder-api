@@ -13,6 +13,10 @@ from openai import OpenAI
 from app.config import get_settings
 from tavily import TavilyClient
 
+from instagram.agent.prompts import (
+    FEED_CANVAS_DESIGN_SYSTEM,
+    build_feed_canvas_design_prompt,
+)
 from instagram.agent.usage_tracking import (
     get_usage_ledger,
     record_anthropic_usage,
@@ -149,34 +153,32 @@ def build_feed_canvas_html(
     tone_s = (tone or "").strip()[:120]
     overlay = (overlay_text or "").strip()[:180]
 
-    hook_line = hook if hook else "(omit teaser line if empty)"
+    design_prompt = build_feed_canvas_design_prompt(
+        image_url=url,
+        overlay_text=overlay,
+        overlay_position=pos,
+        text_style=style,
+        topic=topic_s,
+        tone=tone_s,
+        caption_hook=hook,
+        width_px=w,
+        height_px=h,
+        preset_label=preset_label,
+    )
 
-    prompt = f"""You are a senior UI designer. Output ONE complete HTML5 document only (no markdown, no preamble).
-
-Goal: a static graphic for {preset_label}, fixed canvas {w}px wide by {h}px tall, ready to rasterize in the browser for Instagram.
-
-## Content
-- Background: full-bleed using this URL as a CSS background image (cover, centered):
-  {url}
-- Primary on-image headline (short; line breaks allowed):
-  {overlay}
-- Headline vertical region: {pos} third of the canvas (flex or absolute positioning).
-- Text style: {style} — bold = high-contrast, strong type; minimal = lighter weight, more whitespace.
-- Topic (mood only): {topic_s}
-- Tone: {tone_s}
-- Optional one-line teaser under headline: {hook_line}
-
-## Technical rules (strict)
-- Self-contained: all CSS in one <style> in <head>. No JavaScript.
-- Root: one outer element with id `feed-canvas` with width {w}px; height {h}px; overflow hidden; position relative; box-sizing border-box.
-- Fonts: system-ui stack, or one https Google Fonts <link> if needed.
-- Readability on busy images: gradient scrim, soft shadow, or semi-transparent panel.
-- No external images except the background URL above.
-- No device frames or browser chrome.
-
-Output ONLY the HTML document."""
-
-    raw = _anthropic_text(prompt, max_tokens=8192)
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    msg = client.messages.create(
+        model=settings.anthropic_model,
+        max_tokens=8192,
+        system=FEED_CANVAS_DESIGN_SYSTEM,
+        messages=[{"role": "user", "content": design_prompt}],
+    )
+    record_anthropic_usage(getattr(msg, "usage", None), channel="tools")
+    parts: list[str] = []
+    for block in msg.content:
+        if block.type == "text":
+            parts.append(block.text)
+    raw = "".join(parts).strip()
     html = _strip_code_fences(raw)
     lower = html.lower().strip()
     if not lower.startswith("<!doctype") and not lower.startswith("<html"):

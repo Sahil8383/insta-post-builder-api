@@ -42,3 +42,30 @@ class Post(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class GenerationSession(Base):
+    """Tracks in-flight SSE generation for cross-process cancel."""
+
+    __tablename__ = "generation_sessions"
+
+    class Status:
+        RUNNING = "running"
+        CANCEL_REQUESTED = "cancel_requested"
+        FINISHED = "finished"
+        CANCELLED = "cancelled"
+        FAILED = "failed"
+
+        TERMINAL = frozenset({FINISHED, CANCELLED, FAILED})
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default=Status.RUNNING, index=True)
+    worker_id: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )

@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     agent_max_runtime_seconds: float = 900.0
     agent_thread_join_timeout_seconds: float = 960.0
     max_concurrent_streams: int = 100
+    stream_cancel_poll_seconds: float = 2.0
     anthropic_stream_max_retries: int = 3
     max_stream_request_body_bytes: int = 524_288
 

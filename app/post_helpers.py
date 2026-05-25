@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.constants import USER_CANCEL_MESSAGE
 from app.crud import create_post, get_post
 from app.models import Post
 from instagram.agent.orchestrator import agent_result_to_persist_content
@@ -21,8 +22,6 @@ from instagram.agent.usage_tracking import UsageLedger
 
 USER_QUERY_MAX_LEN = 16_000
 SESSION_SUMMARY_MAX_LEN = 8_000
-
-
 def _truncate_user_query(q: str) -> str:
     q = (q or "").strip()
     if len(q) <= USER_QUERY_MAX_LEN:
@@ -45,6 +44,7 @@ class AgentRunOutcome:
     result: AgentResult | None = None
     error: Exception | None = None
     cancelled: bool = False
+    user_cancel_notified: bool = False
     worker_emitted_error: bool = False
     persisted: bool = False
     db_post_id: int | None = None
@@ -224,9 +224,13 @@ def _sync_persist_stream_outcome(
         cost = outcome.usage_ledger.estimate_total_usd()
         if err is not None:
             msg = (
-                "Request cancelled"
-                if outcome.cancelled
-                else _debug_error_text(err, debug)
+                USER_CANCEL_MESSAGE
+                if outcome.user_cancel_notified
+                else (
+                    USER_CANCEL_MESSAGE
+                    if outcome.cancelled
+                    else _debug_error_text(err, debug)
+                )
             )
             pg = create_post(
                 session,

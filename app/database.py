@@ -18,7 +18,7 @@ class Base(DeclarativeBase):
     pass
 
 
-from app.models import Post
+from app.models import GenerationSession, Post
 
 
 def _ensure_post_columns_sqlite(engine) -> None:
@@ -52,14 +52,16 @@ def _ensure_pgvector_extension(engine) -> None:
 
 
 def ensure_posts_schema() -> None:
-    """Create ``posts`` table if missing; apply additive column upgrades."""
+    """Create app tables if missing; apply additive column upgrades."""
 
     engine = get_engine()
     _ensure_pgvector_extension(engine)
     insp = inspect(engine)
-    if not insp.has_table("posts"):
-        Base.metadata.create_all(bind=engine, tables=[Post.__table__])
-    elif engine.dialect.name == "sqlite":
+    tables = [Post.__table__, GenerationSession.__table__]
+    missing = [t for t in tables if not insp.has_table(t.name)]
+    if missing:
+        Base.metadata.create_all(bind=engine, tables=missing)
+    elif engine.dialect.name == "sqlite" and insp.has_table("posts"):
         _ensure_post_columns_sqlite(engine)
 
 
